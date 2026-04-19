@@ -6,45 +6,93 @@ const fs = require('fs');
 const pdfParse = require('pdf-parse');
 const ExcelJS = require('exceljs');
 const db = require('./db');
-const { extractFromPdf } = require('./gemini');
+const {
+  PROCESSING_VERSION,
+  applyFieldEdit,
+  normalizeDetailLevel,
+  processPdf,
+  validateExtraction,
+} = require('./gemini');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const UPLOAD_DIR = path.join(__dirname, 'uploads');
 
-// Middleware
+fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Multer setup
 const upload = multer({
-  dest: path.join(__dirname, 'uploads'),
+  dest: UPLOAD_DIR,
   fileFilter: (req, file, cb) => {
     if (file.mimetype === 'application/pdf') cb(null, true);
-    else cb(new Error('Only PDF files allowed'));
+    else cb(new Error('Only PDF files are allowed.'));
   },
-  limits: { fileSize: 20 * 1024 * 1024 }
+  limits: { fileSize: 20 * 1024 * 1024 },
 });
 
-// Init DB on startup
-db.getDb().then(() => {
-  console.log('Database initialized');
-}).catch(err => {
-  console.error('DB init error:', err);
-});
+db.getDb()
+  .then(() => console.log('Database initialized'))
+  .catch(err => console.error('DB init error:', err));
 
-// ─── ROUTES ─────────────────────────────────────────────────────────────────
+function safeJsonParse(value, fallback = null) {
+  if (!value) return fallback;
+  try {
+    return JSON.parse(value);
+  } catch (error) {
+    return fallback;
+  }
+}
+
+function summarizeDocument(doc) {
+  const validation = safeJsonParse(doc.validation_json, null);
+  return {
+    ...doc,
+    source_truncated: Boolean(doc.source_truncated),
+    issue_count: validation && Array.isArray(validation.issues) ? validation.issues.length : 0,
+    ready_for_review: validation ? Boolean(validation.ready_for_review) : true,
+  };
+}
+
+function expandDocument(doc) {
+  const summary = summarizeDocument(doc);
+  return {
+    ...summary,
+    spec: safeJsonParse(doc.spec_json, null),
+    structured_output: safeJsonParse(doc.output_json, null),
+    validation: safeJsonParse(doc.validation_json, null),
+  };
+}
+
+function buildUniqueSheetName(baseName, usedNames) {
+  const trimmedBase = baseName.slice(0, 31) || 'Document';
+  let candidate = trimmedBase;
+  let counter = 2;
+
+  while (usedNames.has(candidate)) {
+    const suffix = `_${counter}`;
+    candidate = `${trimmedBase.slice(0, 31 - suffix.length)}${suffix}`;
+    counter += 1;
+  }
+
+  usedNames.add(candidate);
+  return candidate;
+}
 
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-// Upload & process PDFs
 app.post('/api/upload', upload.array('pdfs', 20), async (req, res) => {
+  await db.getDb();
+
   if (!req.files || req.files.length === 0) {
-    return res.status(400).json({ error: 'No files uploaded' });
+    return res.status(400).json({ error: 'No files uploaded.' });
   }
-  console.log("req.files?", req.files);
+
+  const detailLevel = normalizeDetailLevel(req.body.detailLevel);
   const results = [];
   const errors = [];
 
@@ -52,211 +100,283 @@ app.post('/api/upload', upload.array('pdfs', 20), async (req, res) => {
     try {
       const pdfBuffer = fs.readFileSync(file.path);
       const pdfData = await pdfParse(pdfBuffer);
-      const pdfText = pdfData.text;
+      const pdfText = String(pdfData.text || '').trim();
 
-      if (!pdfText || pdfText.trim().length < 10) {
-        errors.push({ filename: file.originalname, error: 'Could not extract text (may be a scanned image PDF)' });
+      if (!pdfText || pdfText.length < 10) {
+        errors.push({
+          filename: file.originalname,
+          error: 'Could not extract text. Image-only PDFs still need OCR support.',
+        });
         continue;
       }
 
-      const extracted = await extractFromPdf(pdfText, file.originalname);
-      console.log("extracted?", extracted);
-      const docId = db.insertDocument(file.originalname, extracted.document_type);
+      const processed = await processPdf({
+        filename: file.originalname,
+        pdfText,
+        detailLevel,
+      });
 
-      for (const field of extracted.fields) {
-        db.insertField(
-          docId,
-          field.field_name,
-          field.field_value !== null && field.field_value !== undefined ? String(field.field_value) : null,
-          field.confidence || 0,
-          field.provenance || '',
-          field.data_type || 'text'
-        );
-      }
+      const docId = db.insertDocument({
+        filename: file.originalname,
+        docType: processed.documentType,
+        detailLevel: processed.detailLevel,
+        summaryText: processed.output.summary,
+        specJson: JSON.stringify(processed.spec),
+        outputJson: JSON.stringify(processed.output),
+        validationJson: JSON.stringify(processed.validation),
+        sourceExcerpt: processed.sourceExcerpt,
+        sourceTruncated: processed.sourceTruncated,
+        processingVersion: processed.processingVersion || PROCESSING_VERSION,
+      });
+
+      db.replaceDocumentFields(docId, processed.flatFields);
 
       results.push({
         id: docId,
         filename: file.originalname,
-        doc_type: extracted.document_type,
-        field_count: extracted.fields.length
+        doc_type: processed.documentType,
+        detail_level: processed.detailLevel,
+        field_count: processed.flatFields.length,
+        issue_count: processed.validation.issues.length,
+        ready_for_review: processed.validation.ready_for_review,
+        summary_text: processed.output.summary,
       });
-
-    } catch (err) {
-      console.error(`Error processing ${file.originalname}:`, err.message);
-      errors.push({ filename: file.originalname, error: err.message });
+    } catch (error) {
+      console.error(`Error processing ${file.originalname}:`, error.message);
+      errors.push({
+        filename: file.originalname,
+        error: error.message,
+      });
     } finally {
-      try { fs.unlinkSync(file.path); } catch (_) {}
+      try {
+        fs.unlinkSync(file.path);
+      } catch (_) {
+        // Ignore upload cleanup errors.
+      }
     }
   }
 
   res.json({ results, errors });
 });
 
-// Get all documents (with field count)
-app.get('/api/documents', (req, res) => {
+app.get('/api/documents', async (req, res) => {
+  await db.getDb();
+
   try {
     const docs = db.getAllDocuments();
-    // Attach field counts
-    const docsWithCount = docs.map(doc => ({
-      ...doc,
-      field_count: db.getFieldsByDocumentId(doc.id).length
-    }));
-    res.json(docsWithCount);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+    const decorated = docs.map(doc => {
+      const summary = summarizeDocument(doc);
+      const fields = db.getFieldsByDocumentId(doc.id);
+      return {
+        ...summary,
+        field_count: fields.length,
+      };
+    });
+    res.json(decorated);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
 });
 
-// Get single document with fields
-app.get('/api/documents/:id', (req, res) => {
+app.get('/api/documents/:id', async (req, res) => {
+  await db.getDb();
+
   try {
     const doc = db.getDocumentById(req.params.id);
-    if (!doc) return res.status(404).json({ error: 'Document not found' });
+    if (!doc) return res.status(404).json({ error: 'Document not found.' });
+
     const fields = db.getFieldsByDocumentId(req.params.id);
-    res.json({ ...doc, fields });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.json({ ...expandDocument(doc), fields });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
 });
 
-// Update a field value
-app.put('/api/fields/:id', (req, res) => {
+app.put('/api/fields/:id', async (req, res) => {
+  await db.getDb();
+
   try {
-    const { value } = req.body;
-    db.updateField(req.params.id, value);
+    const nextValue = req.body.value == null ? null : String(req.body.value);
+    const field = db.getFieldById(req.params.id);
+    if (!field) return res.status(404).json({ error: 'Field not found.' });
+
+    db.updateField(req.params.id, nextValue);
+
+    const doc = db.getDocumentById(field.document_id);
+    if (!doc) return res.json({ success: true });
+
+    const spec = safeJsonParse(doc.spec_json, null);
+    const output = safeJsonParse(doc.output_json, null);
+
+    if (spec && output && field.field_path) {
+      const updatedOutput = applyFieldEdit(output, field.field_path, nextValue);
+      if (updatedOutput) {
+        const validation = validateExtraction(spec, updatedOutput, {
+          sourceTruncated: Boolean(doc.source_truncated),
+        });
+
+        db.updateDocument(doc.id, {
+          outputJson: JSON.stringify(updatedOutput),
+          validationJson: JSON.stringify(validation),
+          summaryText: updatedOutput.summary,
+        });
+      }
+    }
+
     res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
 });
 
-// Delete a document
-app.delete('/api/documents/:id', (req, res) => {
+app.delete('/api/documents/:id', async (req, res) => {
+  await db.getDb();
+
   try {
     db.deleteDocument(req.params.id);
     res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
 });
 
-// Export documents to Excel using ExcelJS
 app.get('/api/export', async (req, res) => {
+  await db.getDb();
+
   try {
-    const ids = req.query.ids ? req.query.ids.split(',') : null;
+    const ids = req.query.ids ? String(req.query.ids).split(',') : null;
     const allDocs = db.getAllDocuments();
     const docsToExport = ids
-      ? allDocs.filter(d => ids.includes(String(d.id)))
+      ? allDocs.filter(doc => ids.includes(String(doc.id)))
       : allDocs;
 
     if (docsToExport.length === 0) {
-      return res.status(400).json({ error: 'No documents to export' });
+      return res.status(400).json({ error: 'No documents to export.' });
     }
 
     const workbook = new ExcelJS.Workbook();
-    workbook.creator = 'DocParse';
+    workbook.creator = 'EasyParse';
     workbook.created = new Date();
 
+    const usedSheetNames = new Set();
+
     for (const doc of docsToExport) {
+      const summary = summarizeDocument(doc);
       const fields = db.getFieldsByDocumentId(doc.id);
-      const sheetName = doc.filename.replace(/\.pdf$/i, '').substring(0, 31);
+      const sheetName = buildUniqueSheetName(
+        doc.filename.replace(/\.pdf$/i, ''),
+        usedSheetNames
+      );
       const sheet = workbook.addWorksheet(sheetName);
 
-      // ── Document meta block ──────────────────────────────────────
       const metaRows = [
         ['Document', doc.filename],
         ['Type', doc.doc_type || 'Unknown'],
+        ['Detail Level', doc.detail_level || 'standard'],
         ['Parsed At', doc.created_at],
-        ['Total Fields', fields.length],
+        ['Validation Issues', summary.issue_count],
+        ['Summary', doc.summary_text || ''],
         [],
       ];
 
       metaRows.forEach(row => sheet.addRow(row));
 
-      // Style meta labels
-      [1, 2, 3, 4].forEach(i => {
-        const cell = sheet.getRow(i).getCell(1);
-        cell.font = { bold: true, color: { argb: 'FF888888' }, size: 10 };
+      [1, 2, 3, 4, 5, 6].forEach(rowIndex => {
+        const cell = sheet.getRow(rowIndex).getCell(1);
+        cell.font = { bold: true, color: { argb: 'FF777777' }, size: 10 };
         cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1A1A1F' } };
       });
 
-      // ── Header row ───────────────────────────────────────────────
-      const headerRow = sheet.addRow(['Field Name', 'Value', 'Data Type', 'Confidence', 'Source / Provenance']);
+      const headerRow = sheet.addRow([
+        'Path',
+        'Field',
+        'Section',
+        'Entry',
+        'Value',
+        'Data Type',
+        'Confidence',
+        'Evidence',
+      ]);
+
       headerRow.eachCell(cell => {
         cell.font = { bold: true, color: { argb: 'FF000000' }, size: 11 };
         cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF00E5A0' } };
         cell.alignment = { vertical: 'middle', horizontal: 'left' };
         cell.border = {
-          bottom: { style: 'medium', color: { argb: 'FF009966' } }
+          bottom: { style: 'medium', color: { argb: 'FF009966' } },
         };
       });
-      headerRow.height = 22;
 
-      // ── Data rows ────────────────────────────────────────────────
-      fields.forEach((f, idx) => {
-        const conf = f.confidence || 0;
-        const confLabel = `${Math.round(conf * 100)}%`;
+      fields.forEach((field, index) => {
+        const confidence = Number(field.confidence || 0);
         const row = sheet.addRow([
-          f.field_name,
-          f.field_value || '',
-          f.data_type || 'text',
-          confLabel,
-          f.provenance || ''
+          field.field_path || '',
+          field.field_label || field.field_name || '',
+          field.section_label || '',
+          field.entry_label || '',
+          field.field_value ?? '',
+          field.data_type || 'text',
+          `${Math.round(confidence * 100)}%`,
+          field.provenance || '',
         ]);
 
-        const isEven = idx % 2 === 0;
-        const bgColor = isEven ? 'FFFAFAFA' : 'FFF3F3F3';
-
+        const background = index % 2 === 0 ? 'FFFAFAFA' : 'FFF3F3F3';
         row.eachCell((cell, colNum) => {
-          cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: bgColor } };
-          cell.alignment = { vertical: 'top', wrapText: colNum === 2 || colNum === 5 };
+          cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: background } };
+          cell.alignment = { vertical: 'top', wrapText: colNum === 1 || colNum === 5 || colNum === 8 };
           cell.border = {
-            bottom: { style: 'thin', color: { argb: 'FFE0E0E0' } }
+            bottom: { style: 'thin', color: { argb: 'FFE0E0E0' } },
           };
         });
 
-        // Colour-code confidence cell
-        const confCell = row.getCell(4);
-        if (conf >= 0.8) {
-          confCell.font = { color: { argb: 'FF007755' }, bold: true };
-        } else if (conf >= 0.5) {
-          confCell.font = { color: { argb: 'FF996600' }, bold: true };
+        const confidenceCell = row.getCell(7);
+        if (confidence >= 0.8) {
+          confidenceCell.font = { color: { argb: 'FF007755' }, bold: true };
+        } else if (confidence >= 0.55) {
+          confidenceCell.font = { color: { argb: 'FF996600' }, bold: true };
         } else {
-          confCell.font = { color: { argb: 'FFCC3300' }, bold: true };
+          confidenceCell.font = { color: { argb: 'FFCC3300' }, bold: true };
         }
-
-        // Type chip styling
-        row.getCell(3).font = { color: { argb: 'FF5B8AFF' }, italic: true };
-
-        row.height = 18;
       });
 
-      // ── Column widths ────────────────────────────────────────────
       sheet.columns = [
-        { key: 'a', width: 32 },
-        { key: 'b', width: 42 },
-        { key: 'c', width: 14 },
-        { key: 'd', width: 13 },
-        { key: 'e', width: 60 },
+        { width: 30 },
+        { width: 28 },
+        { width: 22 },
+        { width: 28 },
+        { width: 40 },
+        { width: 14 },
+        { width: 12 },
+        { width: 50 },
       ];
 
-      // Freeze header row
-      sheet.views = [{ state: 'frozen', ySplit: 6 }]; // 5 meta rows + 1 header
+      sheet.views = [{ state: 'frozen', ySplit: 8 }];
     }
 
-    // Stream to response
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', 'attachment; filename="extracted_data.xlsx"');
+    res.setHeader(
+      'Content-Type',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    );
+    res.setHeader('Content-Disposition', 'attachment; filename="easyparse_export.xlsx"');
     await workbook.xlsx.write(res);
     res.end();
-
-  } catch (err) {
-    console.error('Export error:', err);
-    res.status(500).json({ error: err.message });
+  } catch (error) {
+    console.error('Export error:', error);
+    res.status(500).json({ error: error.message });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`\n🚀 PDF Extractor running at http://localhost:${PORT}\n`);
-  console.log(`📝 Make sure to set GEMINI_API_KEY in your .env file\n`);
+app.use((error, req, res, next) => {
+  if (!error) return next();
+  console.error('Request error:', error.message);
+  res.status(400).json({ error: error.message });
 });
+
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`\nEasyParse running at http://localhost:${PORT}\n`);
+    console.log('Set GEMINI_API_KEY in your .env file before uploading PDFs.\n');
+  });
+}
+
+module.exports = app;
