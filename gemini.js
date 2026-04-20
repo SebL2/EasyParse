@@ -1,5 +1,6 @@
 require('dotenv').config();
 const { GoogleGenerativeAI } = require('@google/generative-ai');
+const { getPredefinedSchemaById, listPredefinedSchemas } = require('./schemas');
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const genAI = GEMINI_API_KEY ? new GoogleGenerativeAI(GEMINI_API_KEY) : null;
@@ -845,14 +846,53 @@ function applyFieldEdit(output, fieldPath, nextValue) {
 }
 
 async function processPdf({ filename, pdfText, detailLevel = 'standard' }) {
+  return processPdfWithSchemaMode({
+    filename,
+    pdfText,
+    detailLevel,
+    schemaMode: 'discover',
+    schemaId: null,
+  });
+}
+
+async function processPdfWithSchemaMode({
+  filename,
+  pdfText,
+  detailLevel = 'standard',
+  schemaMode = 'discover',
+  schemaId = null,
+}) {
   const normalizedDetailLevel = normalizeDetailLevel(detailLevel);
   const normalizedText = normalizePdfText(pdfText);
+  const usePredefined = schemaMode === 'predefined' && schemaId;
 
-  const spec = await discoverExtractionSpec({
-    filename,
-    pdfText: normalizedText,
-    detailLevel: normalizedDetailLevel,
-  });
+  let spec;
+  let schemaSelection;
+
+  if (usePredefined) {
+    const predefinedSchema = getPredefinedSchemaById(schemaId);
+    if (!predefinedSchema) {
+      throw new Error(`Unknown predefined schema: ${schemaId}`);
+    }
+
+    spec = sanitizeSpec(predefinedSchema.spec, normalizedDetailLevel);
+    schemaSelection = {
+      mode: 'predefined',
+      schema_id: predefinedSchema.id,
+      schema_label: predefinedSchema.label,
+    };
+  } else {
+    spec = await discoverExtractionSpec({
+      filename,
+      pdfText: normalizedText,
+      detailLevel: normalizedDetailLevel,
+    });
+    schemaSelection = {
+      mode: 'discover',
+      schema_id: null,
+      schema_label: 'AI Discovered Schema',
+    };
+  }
 
   const { output, sourceTruncated, sourceExcerpt } = await extractStructuredData({
     filename,
@@ -868,6 +908,7 @@ async function processPdf({ filename, pdfText, detailLevel = 'standard' }) {
     documentType: output.document_type,
     title: output.title,
     detailLevel: normalizedDetailLevel,
+    schemaSelection,
     spec,
     output,
     validation,
@@ -884,7 +925,9 @@ module.exports = {
   SUPPORTED_DETAIL_LEVELS,
   applyFieldEdit,
   flattenExtraction,
+  listPredefinedSchemas,
   normalizeDetailLevel,
   processPdf,
+  processPdfWithSchemaMode,
   validateExtraction,
 };

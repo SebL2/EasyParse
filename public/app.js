@@ -3,6 +3,7 @@ let currentDocId = null;
 let currentDoc = null;
 let modifiedFields = new Set();
 let uploadInFlight = false;
+let availableSchemas = [];
 
 const dropZone = document.getElementById('dropZone');
 const fileInput = document.getElementById('fileInput');
@@ -10,6 +11,8 @@ const fileQueueEl = document.getElementById('fileQueue');
 const uploadActions = document.getElementById('uploadActions');
 const processBtn = document.getElementById('processBtn');
 const clearQueueBtn = document.getElementById('clearQueueBtn');
+const schemaMode = document.getElementById('schemaMode');
+const schemaSelect = document.getElementById('schemaSelect');
 const detailLevel = document.getElementById('detailLevel');
 const queueCount = document.getElementById('queueCount');
 const statusMsg = document.getElementById('statusMsg');
@@ -101,6 +104,13 @@ clearQueueBtn.addEventListener('click', () => {
   renderQueue();
 });
 
+schemaMode.addEventListener('change', updateSchemaControls);
+
+function updateSchemaControls() {
+  const usePredefined = schemaMode.value === 'predefined';
+  schemaSelect.disabled = !usePredefined;
+}
+
 processBtn.addEventListener('click', () => processQueue());
 
 async function processQueue() {
@@ -109,6 +119,10 @@ async function processQueue() {
   const formData = new FormData();
   for (const file of fileQueue) formData.append('pdfs', file);
   formData.append('detailLevel', detailLevel.value);
+  formData.append('schemaMode', schemaMode.value);
+  if (schemaMode.value === 'predefined' && schemaSelect.value) {
+    formData.append('schemaId', schemaSelect.value);
+  }
 
   uploadInFlight = true;
   setProcessing(true, `Processing ${fileQueue.length} document${fileQueue.length !== 1 ? 's' : ''} at ${detailLevel.value} detail...`);
@@ -153,6 +167,8 @@ function setProcessing(enabled, message = '') {
   if (message) processingMsg.textContent = message;
   processBtn.disabled = enabled;
   clearQueueBtn.disabled = enabled;
+  schemaMode.disabled = enabled;
+  schemaSelect.disabled = enabled || schemaMode.value !== 'predefined';
   detailLevel.disabled = enabled;
   fileInput.disabled = enabled;
   dropZone.classList.toggle('drop-zone-busy', enabled);
@@ -173,11 +189,33 @@ async function loadDocuments() {
   }
 }
 
+async function loadSchemas() {
+  try {
+    const response = await fetch('/api/schemas');
+    const payload = await response.json();
+    availableSchemas = Array.isArray(payload.predefined) ? payload.predefined : [];
+
+    schemaSelect.innerHTML = availableSchemas.map(schema => (
+      `<option value="${escHtml(schema.id)}">${escHtml(schema.label)}</option>`
+    )).join('');
+
+    if (availableSchemas.length === 0) {
+      schemaSelect.innerHTML = '<option value="">No predefined schemas</option>';
+    }
+
+    updateSchemaControls();
+  } catch (error) {
+    console.error('Failed to load schemas:', error);
+    schemaSelect.innerHTML = '<option value="">Schema catalog unavailable</option>';
+    updateSchemaControls();
+  }
+}
+
 function renderDocuments(docs) {
   if (!docs || docs.length === 0) {
     docsBody.innerHTML = `
       <tr>
-        <td colspan="8">
+        <td colspan="9">
           <div class="empty-state">No documents parsed yet. Upload PDFs above to get started.</div>
         </td>
       </tr>
@@ -202,6 +240,7 @@ function renderDocuments(docs) {
           </div>
         </td>
         <td><span class="badge badge-blue">${escHtml(doc.doc_type || 'Unknown')}</span></td>
+        <td><span class="badge ${doc.schema_mode === 'predefined' ? 'badge-green' : 'badge-muted'}">${escHtml(doc.schema_label || (doc.schema_mode === 'predefined' ? 'Predefined Schema' : 'AI Discover'))}</span></td>
         <td><span class="badge badge-muted">${escHtml((doc.detail_level || 'standard').toUpperCase())}</span></td>
         <td>
           <span class="metric">${Number(doc.field_count || 0)}</span>
@@ -290,6 +329,7 @@ function renderModal(doc) {
 
   modalMeta.innerHTML = `
     <div class="meta-item"><div class="meta-key">Document Type</div><div class="meta-val">${badgeHtml(doc.doc_type || 'Unknown', 'blue')}</div></div>
+    <div class="meta-item"><div class="meta-key">Schema Source</div><div class="meta-val">${badgeHtml(doc.schema_label || (doc.schema_mode === 'predefined' ? 'Predefined Schema' : 'AI Discover'), doc.schema_mode === 'predefined' ? 'green' : 'muted')}</div></div>
     <div class="meta-item"><div class="meta-key">Detail Level</div><div class="meta-val">${badgeHtml((doc.detail_level || 'standard').toUpperCase(), 'muted')}</div></div>
     <div class="meta-item"><div class="meta-key">Validation</div><div class="meta-val">${issueCount > 0 ? badgeHtml(`${issueCount} issue${issueCount !== 1 ? 's' : ''}`, 'warn') : badgeHtml('Ready', 'green')}</div></div>
     <div class="meta-item"><div class="meta-key">Parsed At</div><div class="meta-val">${new Date(doc.created_at).toLocaleString()}</div></div>
@@ -486,4 +526,5 @@ function badgeHtml(label, tone) {
   return `<span class="badge ${toneClass}">${escHtml(label)}</span>`;
 }
 
+loadSchemas();
 loadDocuments();

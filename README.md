@@ -49,21 +49,61 @@ npm start
 
 Open [http://localhost:3000](http://localhost:3000).
 
+## Deploy to Vercel
+
+The repo ships a serverless entrypoint at `api/index.js` and a `vercel.json`
+that routes all non-static requests through the Express app.
+
+1. Push the repo to GitHub and import it in Vercel (or run `vercel` from the
+   Vercel CLI).
+2. In the Vercel project settings, add an environment variable:
+   - `GEMINI_API_KEY` = your Gemini API key
+3. Deploy.
+
+### Vercel caveats
+
+- **Storage is ephemeral.** Vercel serverless functions only have `/tmp` as a
+  writable path, and `/tmp` is wiped on cold starts. This app stores its
+  SQLite file there, so uploaded documents will eventually disappear. For
+  durable storage swap `db.js` for an external database (Vercel Postgres,
+  Turso, Supabase, Neon, etc.).
+- **Request body size.** Vercel caps serverless request bodies at 4.5 MB by
+  default. Large PDFs near the 20 MB client-side limit will be rejected at
+  the platform edge before they reach the app.
+- **Execution time.** `vercel.json` sets `maxDuration` to 60s, which is the
+  hobby-plan ceiling. Very large PDFs may still time out; use Pro if you need
+  up to 300s.
+- Uploads now use in-memory multer storage, so no `uploads/` directory is
+  needed at runtime.
+
 ## Current Flow
 
 1. Upload one or more PDFs
-2. Choose a detail level:
+2. Choose a schema mode:
+   - `AI Discover` to let the model design the extraction schema
+   - `Predefined Schema` to lock extraction to an established schema
+3. Choose a detail level:
    - `core`
    - `standard`
    - `exhaustive`
-3. EasyParse:
+4. EasyParse:
    - extracts PDF text
-   - discovers an extraction spec
+   - either loads the chosen predefined schema or discovers a schema
    - extracts structured data
    - validates the output
    - stores flattened review rows
-4. Review/edit fields in the modal
-5. Export the flattened review rows to Excel
+5. Review/edit fields in the modal
+6. Export the flattened review rows to Excel
+
+## Predefined Schemas
+
+The app now ships with several established schemas:
+- `Academic Transcript`
+- `Invoice`
+- `Resume / CV`
+- `Contract / Agreement`
+
+Users can still skip those and let the model infer the schema from the PDF.
 
 ## Data Model
 

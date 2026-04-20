@@ -2,30 +2,27 @@ require('dotenv').config();
 const express = require('express');
 const multer = require('multer');
 const path = require('path');
-const fs = require('fs');
-const pdfParse = require('pdf-parse');
+const pdfParse = require('pdf-parse/lib/pdf-parse.js');
 const ExcelJS = require('exceljs');
 const db = require('./db');
 const {
   PROCESSING_VERSION,
   applyFieldEdit,
+  listPredefinedSchemas,
   normalizeDetailLevel,
-  processPdf,
+  processPdfWithSchemaMode,
   validateExtraction,
 } = require('./gemini');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const UPLOAD_DIR = path.join(__dirname, 'uploads');
-
-fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 const upload = multer({
-  dest: UPLOAD_DIR,
+  storage: multer.memoryStorage(),
   fileFilter: (req, file, cb) => {
     if (file.mimetype === 'application/pdf') cb(null, true);
     else cb(new Error('Only PDF files are allowed.'));
@@ -55,6 +52,17 @@ function summarizeDocument(doc) {
     ready_for_review: validation ? Boolean(validation.ready_for_review) : true,
   };
 }
+
+app.get('/api/schemas', (req, res) => {
+  res.json({
+    discovery: {
+      id: 'discover',
+      label: 'AI Discover Schema',
+      description: 'Let the model inspect the PDF and design the extraction schema automatically.',
+    },
+    predefined: listPredefinedSchemas(),
+  });
+});
 
 function expandDocument(doc) {
   const summary = summarizeDocument(doc);
@@ -93,12 +101,14 @@ app.post('/api/upload', upload.array('pdfs', 20), async (req, res) => {
   }
 
   const detailLevel = normalizeDetailLevel(req.body.detailLevel);
+  const schemaMode = req.body.schemaMode === 'predefined' ? 'predefined' : 'discover';
+  const schemaId = schemaMode === 'predefined' ? String(req.body.schemaId || '').trim() : null;
   const results = [];
   const errors = [];
 
   for (const file of req.files) {
     try {
-      const pdfBuffer = fs.readFileSync(file.path);
+      const pdfBuffer = file.buffer;
       const pdfData = await pdfParse(pdfBuffer);
       const pdfText = String(pdfData.text || '').trim();
 
@@ -110,16 +120,21 @@ app.post('/api/upload', upload.array('pdfs', 20), async (req, res) => {
         continue;
       }
 
-      const processed = await processPdf({
+      const processed = await processPdfWithSchemaMode({
         filename: file.originalname,
         pdfText,
         detailLevel,
+        schemaMode,
+        schemaId,
       });
 
       const docId = db.insertDocument({
         filename: file.originalname,
         docType: processed.documentType,
         detailLevel: processed.detailLevel,
+        schemaMode: processed.schemaSelection.mode,
+        schemaId: processed.schemaSelection.schema_id,
+        schemaLabel: processed.schemaSelection.schema_label,
         summaryText: processed.output.summary,
         specJson: JSON.stringify(processed.spec),
         outputJson: JSON.stringify(processed.output),
@@ -136,6 +151,9 @@ app.post('/api/upload', upload.array('pdfs', 20), async (req, res) => {
         filename: file.originalname,
         doc_type: processed.documentType,
         detail_level: processed.detailLevel,
+        schema_mode: processed.schemaSelection.mode,
+        schema_id: processed.schemaSelection.schema_id,
+        schema_label: processed.schemaSelection.schema_label,
         field_count: processed.flatFields.length,
         issue_count: processed.validation.issues.length,
         ready_for_review: processed.validation.ready_for_review,
@@ -147,12 +165,6 @@ app.post('/api/upload', upload.array('pdfs', 20), async (req, res) => {
         filename: file.originalname,
         error: error.message,
       });
-    } finally {
-      try {
-        fs.unlinkSync(file.path);
-      } catch (_) {
-        // Ignore upload cleanup errors.
-      }
     }
   }
 

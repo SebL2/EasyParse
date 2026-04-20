@@ -762,6 +762,19 @@
           <button class="btn btn-accent" id="processBtn">⚡ Process Queue</button>
           <button class="btn" id="clearQueueBtn">Clear Queue</button>
           <div class="select-wrap">
+            <label for="schemaMode">Schema Mode</label>
+            <select id="schemaMode" class="select-control">
+              <option value="discover" selected>AI Discover</option>
+              <option value="predefined">Predefined Schema</option>
+            </select>
+          </div>
+          <div class="select-wrap">
+            <label for="schemaSelect">Schema</label>
+            <select id="schemaSelect" class="select-control" disabled>
+              <option value="">Loading schemas...</option>
+            </select>
+          </div>
+          <div class="select-wrap">
             <label for="detailLevel">Detail Level</label>
             <select id="detailLevel" class="select-control">
               <option value="core">Core</option>
@@ -788,6 +801,7 @@
                 <th style="width:36px"><input type="checkbox" id="selectAll" class="row-check" /></th>
                 <th>Filename</th>
                 <th>Type</th>
+                <th>Schema</th>
                 <th>Detail</th>
                 <th>Fields</th>
                 <th>Issues</th>
@@ -797,7 +811,7 @@
             </thead>
             <tbody id="docsBody">
               <tr>
-                <td colspan="8">
+                <td colspan="9">
                   <div class="empty-state">No documents parsed yet. Upload PDFs above to get started.</div>
                 </td>
               </tr>

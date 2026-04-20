@@ -2,20 +2,37 @@ const initSqlJs = require('sql.js');
 const fs = require('fs');
 const path = require('path');
 
-const DB_PATH = path.join(__dirname, 'data.sqlite');
+const BUNDLED_DB_PATH = path.join(__dirname, 'data.sqlite');
+
+// On serverless platforms like Vercel, only /tmp is writable. Keep the SQLite
+// file there so saves don't crash. Note that /tmp is ephemeral: data resets on
+// cold starts. For durable storage, swap this for an external database.
+const IS_SERVERLESS = Boolean(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME);
+const DB_PATH = IS_SERVERLESS
+  ? path.join('/tmp', 'data.sqlite')
+  : BUNDLED_DB_PATH;
 
 let db = null;
 
 async function getDb() {
   if (db) return db;
 
-  const SQL = await initSqlJs();
+  const SQL = await initSqlJs({
+    locateFile: filename => require.resolve(`sql.js/dist/${filename}`),
+  });
 
+  let seedBuffer = null;
   if (fs.existsSync(DB_PATH)) {
-    db = new SQL.Database(fs.readFileSync(DB_PATH));
-  } else {
-    db = new SQL.Database();
+    seedBuffer = fs.readFileSync(DB_PATH);
+  } else if (IS_SERVERLESS && fs.existsSync(BUNDLED_DB_PATH)) {
+    try {
+      seedBuffer = fs.readFileSync(BUNDLED_DB_PATH);
+    } catch (_) {
+      seedBuffer = null;
+    }
   }
+
+  db = seedBuffer ? new SQL.Database(seedBuffer) : new SQL.Database();
 
   db.run('PRAGMA foreign_keys = ON');
 
@@ -43,6 +60,9 @@ async function getDb() {
 
   ensureColumns('documents', {
     detail_level: 'TEXT',
+    schema_mode: 'TEXT',
+    schema_id: 'TEXT',
+    schema_label: 'TEXT',
     summary_text: 'TEXT',
     spec_json: 'TEXT',
     output_json: 'TEXT',
@@ -73,8 +93,14 @@ async function getDb() {
 
 function saveDb() {
   if (!db) return;
-  const buffer = Buffer.from(db.export());
-  fs.writeFileSync(DB_PATH, buffer);
+  try {
+    const buffer = Buffer.from(db.export());
+    fs.writeFileSync(DB_PATH, buffer);
+  } catch (error) {
+    // On read-only filesystems (e.g. Vercel outside /tmp) swallow the write
+    // error so requests still succeed against the in-memory copy.
+    console.warn('saveDb: could not persist database:', error.message);
+  }
 }
 
 function getAll(sql, params = []) {
@@ -110,6 +136,9 @@ function insertDocument({
   filename,
   docType,
   detailLevel,
+  schemaMode,
+  schemaId,
+  schemaLabel,
   summaryText,
   specJson,
   outputJson,
@@ -125,6 +154,9 @@ function insertDocument({
       filename,
       doc_type,
       detail_level,
+      schema_mode,
+      schema_id,
+      schema_label,
       summary_text,
       spec_json,
       output_json,
@@ -132,11 +164,14 @@ function insertDocument({
       source_excerpt,
       source_truncated,
       processing_version
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       filename,
       docType || null,
       detailLevel || 'standard',
+      schemaMode || 'discover',
+      schemaId || null,
+      schemaLabel || null,
       summaryText || null,
       specJson || null,
       outputJson || null,
@@ -205,6 +240,9 @@ function updateDocument(id, patch) {
   const mapping = {
     docType: 'doc_type',
     detailLevel: 'detail_level',
+    schemaMode: 'schema_mode',
+    schemaId: 'schema_id',
+    schemaLabel: 'schema_label',
     summaryText: 'summary_text',
     specJson: 'spec_json',
     outputJson: 'output_json',
