@@ -17,9 +17,12 @@ let db = null;
 async function getDb() {
   if (db) return db;
 
-  const SQL = await initSqlJs({
-    locateFile: filename => require.resolve(`sql.js/dist/${filename}`),
-  });
+  // Load the sql.js wasm file as a buffer so bundlers (e.g. Vercel's ncc)
+  // are guaranteed to trace and include it in the deployment package.
+  const wasmPath = require.resolve('sql.js/dist/sql-wasm.wasm');
+  const wasmBinary = fs.readFileSync(wasmPath);
+
+  const SQL = await initSqlJs({ wasmBinary });
 
   let seedBuffer = null;
   if (fs.existsSync(DB_PATH)) {
