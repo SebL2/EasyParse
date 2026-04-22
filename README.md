@@ -19,6 +19,8 @@ EasyParse is an AI-powered PDF extraction workbench built around a structured tw
 
 The repo no longer treats every PDF as one flat list of `field_name -> field_value`.
 
+The frontend is now a React app built with Vite and organized into modular shadcn-style components instead of a single static script.
+
 It now stores:
 - the discovered extraction spec
 - the structured extraction output

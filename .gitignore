@@ -24,5 +24,6 @@ TestResults.xml
 data.sqlite
 .env
 node_modules/
+dist/
 test.py
 transcript.pdf

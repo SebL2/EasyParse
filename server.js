@@ -16,10 +16,11 @@ const {
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const CLIENT_DIST_DIR = path.join(__dirname, 'dist');
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static(CLIENT_DIST_DIR));
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -90,7 +91,7 @@ function buildUniqueSheetName(baseName, usedNames) {
 }
 
 app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+  res.sendFile(path.join(CLIENT_DIST_DIR, 'index.html'));
 });
 
 app.post('/api/upload', upload.array('pdfs', 20), async (req, res) => {
@@ -376,6 +377,10 @@ app.get('/api/export', async (req, res) => {
     console.error('Export error:', error);
     res.status(500).json({ error: error.message });
   }
+});
+
+app.get(/^(?!\/api).*/, (req, res) => {
+  res.sendFile(path.join(CLIENT_DIST_DIR, 'index.html'));
 });
 
 app.use((error, req, res, next) => {
