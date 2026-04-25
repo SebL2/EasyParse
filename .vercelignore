@@ -1,9 +1,0 @@
-.venv
-.git
-.env
-node_modules
-test.py
-transcript.pdf
-uploads
-data.sqlite
-README.md
